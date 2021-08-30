@@ -2,7 +2,7 @@ import uuid
 import json
 import requests
 
-from flask import Flask, request
+from flask import Flask, request, Response
 
 from phapi import PHSession
 
@@ -18,8 +18,14 @@ sessions = {}
 
 @app.route("/redirect_request")
 def redirect_request():
+    uid = request.args.get("authtoken")
     endpoint = request.args.get("endpoint")
-    return requests.get(endpoint).content
+    session = sessions[uid]
+    rresponse = session.session.get(endpoint)
+    response = Response(rresponse.content)
+    for h in rresponse.headers.keys():
+        response.headers[h] = rresponse.headers[h]
+    return response
 
 @app.route("/authenticate")
 def authenticate():
@@ -58,8 +64,13 @@ def video_stream():
 
 @app.route("/video/stream/m3u8")
 def video_m3u8():
+    uid = request.args.get("authtoken")
+    session = sessions[uid]
     master_url = request.args.get("master_url")
-    return PHSession.get_video_hls_from_master(master_url)
+    resp = session.get_video_hls_from_master(master_url, uid)
+    response = Response(resp)
+    response.headers["content-type"] = "application/vnd.apple.mpegurl"
+    return response
 
 @app.route("/model/info")
 def model_info():

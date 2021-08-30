@@ -118,9 +118,8 @@ class PHSession:
             "results": videos
         }
 
-    @staticmethod
-    def get_video_hls_from_master(master_url):
-        response = requests.get(master_url).text.split("\n")
+    def get_video_hls_from_master(self, master_url, authtoken):
+        response = self.session.get(master_url).text.split("\n")
         index = [x for x in response if "index-" in x]
         if len(index) != 1:
             raise ValueError(index)
@@ -131,7 +130,7 @@ class PHSession:
         index_response = requests.get(index_url).text.split("\n")
         for i in range(len(index_response)):
             if "seg-" in index_response[i]:
-                index_response[i] = f"https://e2d9f1653f4c.ngrok.io/redirect_request?endpoint={quote_plus(base_url + '/' + index_response[i])}"
+                index_response[i] = f"https://e2d9f1653f4c.ngrok.io/redirect_request?authtoken={authtoken}&endpoint={quote_plus(base_url + '/' + index_response[i])}"
 
         return "\n".join(index_response)
 
