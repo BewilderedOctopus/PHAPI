@@ -78,9 +78,11 @@ class PHSession:
             uploader_internal_name = "/".join(uploader_element[0][0].attrib["href"].split("/")[2:])
 
             uploader_dict = {
-                "uploader_type": uploader_type,
-                "uploader_name": uploader_name,
-                "uploader_internal_name": uploader_internal_name,
+                "uploader": {
+                    "uploader_type": uploader_type,
+                    "uploader_name": uploader_name,
+                    "uploader_internal_name": uploader_internal_name,
+                }
             }
 
         premium = len(filter_children_recursive(item, lambda x: "class" in x.attrib.keys() and "premiumIcon" in x.attrib["class"])) == 1
@@ -115,6 +117,23 @@ class PHSession:
             "resolved_pages": max_page,
             "results": videos
         }
+
+    @staticmethod
+    def get_video_hls_from_master(master_url):
+        response = requests.get(master_url).text.split("\n")
+        index = [x for x in response if "index-" in x]
+        if len(index) != 1:
+            raise ValueError(index)
+        index = index[0]
+
+        base_url = master_url.split("/master")[0]
+        index_url = base_url + "/" + index
+        index_response = requests.get(index_url).text.split("\n")
+        for i in range(len(index_response)):
+            if "seg-" in index_response[i]:
+                index_response[i] = f"https://e2d9f1653f4c.ngrok.io/redirect_request?endpoint={quote_plus(base_url + '/' + index_response[i])}"
+
+        return "\n".join(index_response)
 
     def get_video_info(self, viewkey):
         video_url = f"{self.base_url}/view_video.php?viewkey={viewkey}"
@@ -179,6 +198,7 @@ class PHSession:
         pornstars = [{"name": x.attrib["data-mxptext"], "internal_name": "/".join(x.attrib["href"].split("/")[2:]), "image": x[0].attrib["data-src"]} for x in pornstars]
 
         return {
+            "viewkey": viewkey,
             "title": title,
             "thumbnail": thumbnail_url,
             "views": views,
@@ -215,7 +235,8 @@ class PHSession:
         d = {}
         exec(media_exec, d)
 
-        return json.loads(self.session.get(d["media_1"]).text)
+        streams = json.loads(self.session.get(d["media_1"]).text)
+        return streams[:-1]
 
     def get_model_info(self, internal_name):
         model_url = f"{self.base_url}/model/{internal_name}"

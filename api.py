@@ -1,5 +1,6 @@
 import uuid
 import json
+import requests
 
 from flask import Flask, request
 
@@ -7,7 +8,18 @@ from phapi import PHSession
 
 app = Flask(__name__)
 
+@app.after_request
+def after_request(response):
+    header = response.headers
+    header['Access-Control-Allow-Origin'] = '*'
+    return response
+
 sessions = {}
+
+@app.route("/redirect_request")
+def redirect_request():
+    endpoint = request.args.get("endpoint")
+    return requests.get(endpoint).content
 
 @app.route("/authenticate")
 def authenticate():
@@ -36,13 +48,18 @@ def video_search():
     result = session.search_videos(query, int(page))
     return json.dumps(result)
 
-@app.route("/video/stream")
+@app.route("/video/stream/masters")
 def video_stream():
     uid = request.args.get("authtoken")
     viewkey = request.args.get("viewkey")
     session = sessions[uid]
     streams = session.get_video_streams(viewkey)
     return json.dumps(streams)
+
+@app.route("/video/stream/m3u8")
+def video_m3u8():
+    master_url = request.args.get("master_url")
+    return PHSession.get_video_hls_from_master(master_url)
 
 @app.route("/model/info")
 def model_info():
