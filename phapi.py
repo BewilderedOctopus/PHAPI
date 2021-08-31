@@ -329,8 +329,17 @@ class PHSession:
         if ps_container is None:
             raise ValueError(ps_container)
         wraps = filter_children_recursive(ps_container, lambda x: "class" in x.attrib.keys() and x.attrib["class"] == "wrap")
-        links = [x[2][0] for x in wraps]
-        pornstars = [{"name": x.text, "internal_name": "/".join(x.attrib["href"].split("/")[2:])} for x in links]
+        names = [x[2][0].text for x in wraps]
+        internal_names = ["/".join(x[2][0].attrib["href"].split("/")[2:]) for x in wraps]
+        pictures = []
+        for i in wraps:
+            dtu = filter_children_recursive(i, lambda x: "data-thumb_url" in x.attrib.keys())
+            if len(dtu) != 1:
+                raise ValueError(dtu)
+            pictures.append(dtu[0].attrib["data-thumb_url"])
+        if len(names) != len(internal_names) and len(internal_names) != len(pictures):
+            raise ValueError((names, internal_names, pictures))
+        pornstars = [{"name": x[0], "internal_name": x[1], "picture": x[2]} for x in zip(names, internal_names, pictures)]
 
         pagination_container = get_xpath(tree, "//div[@class=\"pagination3\"]")
         if pagination_container is None:
