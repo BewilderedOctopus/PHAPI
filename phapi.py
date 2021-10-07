@@ -1,15 +1,19 @@
 from urllib.parse import quote_plus
+from multiprocessing import Lock
 import re
 import requests
 import json
+import js2py
 from lxml import etree
 
 from utils import urlencode_postdata, _hidden_inputs, get_xpath, filter_children_recursive, int_or_none
 
 class PHSession:
     def __init__(self, username=None, password=None, premium=False):
+        self.username = username
         self.premium = premium
         self.base_url = f"https://www.pornhub{'premium' if premium else ''}.com"
+        self.lock = Lock()
         if premium:
             self.session, resp = self.login(username, password, premium)
             if self.session is None:
@@ -43,6 +47,9 @@ class PHSession:
     def pcvideolistitem_extract(item, needs_uploader=True):
         viewkey = item.attrib["data-video-vkey"]
 
+        if len(filter_children_recursive(item, lambda x: "class" in x.attrib.keys() and x.attrib["class"] == "privateOverlay")) > 0:
+            return (None,)
+
         title = filter_children_recursive(item, lambda x: "href" in x.attrib.keys() and ("view_video" in x.attrib["href"] or "javascript:void" in x.attrib["href"]))
         if len(title) != 2:
             raise ValueError(title)
@@ -73,17 +80,18 @@ class PHSession:
             uploader_element = filter_children_recursive(item, lambda x: "class" in x.attrib.keys() and "usernameWrap" in x.attrib["class"])
             if len(uploader_element) != 1:
                 raise ValueError(uploader_element)
-            uploader_type = uploader_element[0][0].attrib["href"].split("/")[1]
-            uploader_name = uploader_element[0][0].text
-            uploader_internal_name = "/".join(uploader_element[0][0].attrib["href"].split("/")[2:])
+            if "href" in uploader_element[0][0].attrib.keys():
+                uploader_type = uploader_element[0][0].attrib["href"].split("/")[1]
+                uploader_name = uploader_element[0][0].text
+                uploader_internal_name = "/".join(uploader_element[0][0].attrib["href"].split("/")[2:])
 
-            uploader_dict = {
-                "uploader": {
-                    "uploader_type": uploader_type,
-                    "uploader_name": uploader_name,
-                    "uploader_internal_name": uploader_internal_name,
+                uploader_dict = {
+                    "uploader": {
+                        "uploader_type": uploader_type,
+                        "uploader_name": uploader_name,
+                        "uploader_internal_name": uploader_internal_name,
+                    }
                 }
-            }
 
         premium = len(filter_children_recursive(item, lambda x: "class" in x.attrib.keys() and "premiumIcon" in x.attrib["class"])) == 1
 
@@ -98,28 +106,49 @@ class PHSession:
         }, **uploader_dict}
 
     @staticmethod
-    def return_video_page(videos_container, tree, needs_uploader):
+    def return_video_page(videos_container, tree, needs_uploader, resolved_pages=None):
         if videos_container is None:
             raise ValueError(videos_container)
 
         videos = [PHSession.pcvideolistitem_extract(x, needs_uploader) for x in videos_container if "class" in x.attrib.keys() and "pcVideoListItem" in x.attrib["class"]]
+        videos = [x for x in videos if x != (None,)]
         if None in videos:
             raise ValueError(videos)
 
-        pagination_container = get_xpath(tree, "//div[@class=\"pagination3\"]")
-        if pagination_container is None:
-            max_page = 1
-        else:
-            pagenums = [y for y in [int_or_none(x[0].text) for x in pagination_container[0]] if y is not None]
-            max_page = max(pagenums)
+        if resolved_pages is None:
+            pagination_container = get_xpath(tree, "//div[@class=\"pagination3\"]")
+            if pagination_container is None:
+                max_page = 1
+            else:
+                pagenums = [y for y in [int_or_none(x[0].text) for x in pagination_container[0]] if y is not None]
+                max_page = max(pagenums)
+            resolved_pages = max_page
 
         return {
-            "resolved_pages": max_page,
+            "resolved_pages": resolved_pages,
             "results": videos
         }
 
+    def get_from_pornhub(self, url, should_lock=True):
+        with (self.lock if should_lock else Lock()):
+            response = self.session.get(url).text
+            if "function leastFactor" not in response:
+                return response
+
+            jscode = re.findall(r"(function leastFactor.*){ document\.cookie", response, flags=re.DOTALL)[0]
+            finalline = re.findall(r"cookie.(.RNKEY.*;.);", response)[0]
+            jscode += f"return {finalline};\n" + "}\ngo();"
+            newcookies = [x.split("=") for x in js2py.eval_js(jscode).split(";")]
+            newcookies = [x for x in newcookies if len(x) == 2]
+            for cv in newcookies:
+                c, v = cv
+                self.session.cookies[c] = v
+            print(f"set new cookies: {newcookies}")
+
+            return self.get_from_pornhub(url, False)
+
     def get_video_hls_from_master(self, master_url, authtoken):
-        response = self.session.get(master_url).text.split("\n")
+        response = self.get_from_pornhub(master_url).split("\n")
         index = [x for x in response if "index-" in x]
         if len(index) != 1:
             raise ValueError(index)
@@ -136,7 +165,7 @@ class PHSession:
 
     def get_video_info(self, viewkey):
         video_url = f"{self.base_url}/view_video.php?viewkey={viewkey}"
-        video_page = self.session.get(video_url).text
+        video_page = self.get_from_pornhub(video_url)
 
         tree = etree.HTML(video_page)
 
@@ -186,6 +215,7 @@ class PHSession:
 
         related_container = get_xpath(tree, "//ul[@id=\"relatedVideosCenter\"]")
         related_videos = [PHSession.pcvideolistitem_extract(x) for x in related_container]
+        related_videos = [x for x in related_videos if x != (None,)]
         if None in related_videos:
             raise ValueError(related_videos)
 
@@ -214,7 +244,8 @@ class PHSession:
 
     def search_videos(self, query, page):
         search_url = f"{self.base_url}/video/search?search={quote_plus(query)}&page={page}"
-        search_page = self.session.get(search_url).text
+        search_page = self.get_from_pornhub(search_url)
+        open("debug.html", "wb").write(search_page.encode("ascii", "ignore"))
 
         tree = etree.HTML(search_page)
 
@@ -223,7 +254,7 @@ class PHSession:
 
     def get_video_streams(self, viewkey):
         video_url = f"{self.base_url}/view_video.php?viewkey={viewkey}"
-        video_page = self.session.get(video_url).text
+        video_page = self.get_from_pornhub(video_url)
 
         media_matches = re.findall("media_0;(var.*var media_1=.*?;)", video_page)
         if len(media_matches) == 0:
@@ -234,12 +265,13 @@ class PHSession:
         d = {}
         exec(media_exec, d)
 
-        streams = json.loads(self.session.get(d["media_1"]).text)
-        return streams[:-1]
+        streams = json.loads(self.get_from_pornhub(d["media_1"]))
+        return [x for x in streams if isinstance(x["defaultQuality"], bool)]
+        #return streams[:-1]
 
     def get_model_info(self, internal_name):
         model_url = f"{self.base_url}/model/{internal_name}"
-        model_page = self.session.get(model_url).text
+        model_page = self.get_from_pornhub(model_url)
 
         tree = etree.HTML(model_page)
 
@@ -259,7 +291,10 @@ class PHSession:
         about_me_container = filter_children_recursive(tree, lambda x: "class" in x.attrib.keys() and "aboutMeSection" in x.attrib["class"])
         if len(about_me_container) != 1:
             raise ValueError(about_me_container)
-        about_me = about_me_container[0][1].text.strip("\n\t \r")
+        if len(about_me_container[0]) < 2:
+            about_me = ""
+        else:
+            about_me = about_me_container[0][1].text.strip("\n\t \r")
 
         return {
             "name": name,
@@ -271,7 +306,7 @@ class PHSession:
 
     def get_model_videos(self, internal_name, page):
         model_videos_url = f"{self.base_url}/model/{internal_name}/videos?page={page}"
-        model_videos_page = self.session.get(model_videos_url).text
+        model_videos_page = self.get_from_pornhub(model_videos_url)
 
         tree = etree.HTML(model_videos_page)
 
@@ -280,7 +315,7 @@ class PHSession:
 
     def get_pornstar_info(self, internal_name):
         pornstar_url = f"{self.base_url}/pornstar/{internal_name}"
-        pornstar_page = self.session.get(pornstar_url).text
+        pornstar_page = self.get_from_pornhub(pornstar_url)
 
         tree = etree.HTML(pornstar_page)
 
@@ -293,15 +328,23 @@ class PHSession:
             raise ValueError(name)
         name = name[0].text.strip("\n\t \r")
 
-        bio = get_xpath(profile_container, "//div[@class=\"bio\"]")
-        if bio is None:
-            raise ValueError(bio)
-        bio = bio[1].text.strip("\n\t \r")
+        bio1 = get_xpath(profile_container, "//div[@itemprop=\"description\"]")
+        bio2 = get_xpath(profile_container, "//div[@class=\"bio\"]")
+        if bio1 is None and bio2 is None:
+            bio = ""
+        if bio1 is not None:
+            bio = bio1.text.strip("\n\t \r")
+        elif bio2 is not None:
+            bio = bio2[1].text.strip("\n\t \r")
 
-        img = get_xpath(profile_container, "//div[@class=\"thumbImage\"]")
-        if img is None:
-            raise ValueError(img)
-        img = img[0].attrib["src"]
+        img1 = get_xpath(profile_container, "//img[@id=\"getAvatar\"]")
+        img2 = get_xpath(profile_container, "//div[@class=\"thumbImage\"]")
+        if img1 is None and img2 is None:
+            raise ValueError((img1, img2))
+        if img1 is not None:
+            img = img1.attrib["src"]
+        else:
+            img = img2[0].attrib["src"]
 
         return {
             "name": name,
@@ -312,16 +355,26 @@ class PHSession:
 
     def get_pornstar_videos(self, internal_name, page):
         pornstar_videos_url = f"{self.base_url}/pornstar/{internal_name}?page={page}"
-        pornstar_videos_page = self.session.get(pornstar_videos_url).text
+        pornstar_videos_page = self.get_from_pornhub(pornstar_videos_url)
 
         tree = etree.HTML(pornstar_videos_page)
 
         videos_container = get_xpath(tree, "//ul[@id=\"pornstarsVideoSection\"]")
+        if videos_container is None:
+            pornstar_videos_url = f"{self.base_url}/pornstar/{internal_name}/videos?page={page}"
+            pornstar_videos_page = self.get_from_pornhub(pornstar_videos_url)
+
+            tree = etree.HTML(pornstar_videos_page)
+
+            videos_container = get_xpath(tree, "//ul[@id=\"mostRecentVideosSection\"]")
+            if videos_container is None:
+                raise ValueError(videos_container)
+
         return PHSession.return_video_page(videos_container, tree, True)
 
     def search_pornstars(self, query, page):
         search_url = f"{self.base_url}/pornstars/search?search={quote_plus(query)}&page={page}"
-        search_page = self.session.get(search_url).text
+        search_page = self.get_from_pornhub(search_url)
 
         tree = etree.HTML(search_page)
 
@@ -353,9 +406,9 @@ class PHSession:
             "results": pornstars
         }
 
-    def channel_info(self, internal_name):
+    def get_channel_info(self, internal_name):
         channel_url = f"{self.base_url}/channels/{internal_name}"
-        channel_page = self.session.get(channel_url).text
+        channel_page = self.get_from_pornhub(channel_url)
 
         tree = etree.HTML(channel_page)
 
@@ -363,10 +416,19 @@ class PHSession:
         if profile_section is None:
             raise ValueError(profile_section)
         
-        name = filter_children_recursive(profile_section[0], lambda x: "class" in x.attrib.keys() and "title" in x.attrib["class"].split(" "))
-        if len(name) != 1:
+        #_name = filter_children_recursive(profile_section[0], lambda x: "class" in x.attrib.keys() and "title" in x.attrib["class"].split(" "))
+        _name = get_xpath(tree, "//div[@class=\"title floatLeft\"]")
+        if _name is None:
+            raise ValueError(_name)
+        name = _name[0].text
+        if name is None:
+            name = _name[1].text
+        _ = """
+        if len(_name) != 1:
             raise ValueError(name)
-        name = name[0][0].text
+        name = _name[0][0].text
+        if name is None:
+            name = _name[1].text"""
 
         desc = get_xpath(tree, "//div[@class=\"cdescriptions\"]")
         if desc is None:
@@ -391,10 +453,10 @@ class PHSession:
             "banner_picture": banner_image
         }
 
-    def channel_videos(self, internal_name, sort, page):
+    def get_channel_videos(self, internal_name, sort, page):
         sort = {"recent": "da", "rated": "ra", "viewed": "vi"}[sort]
         channel_videos_url = f"{self.base_url}/channels/{internal_name}/videos?o={sort}&page={page}"
-        channel_videos_page = self.session.get(channel_videos_url).text
+        channel_videos_page = self.get_from_pornhub(channel_videos_url)
 
         tree = etree.HTML(channel_videos_page)
 
@@ -407,7 +469,7 @@ class PHSession:
         if timespan is not None:
             timespan = {"week": "w", "month": "m", "all": "a"}[timespan]
             fp_videos_url += f"&t={timespan}"
-        fp_videos_page = self.session.get(fp_videos_url).text
+        fp_videos_page = self.get_from_pornhub(fp_videos_url)
 
         tree = etree.HTML(fp_videos_page)
 
@@ -416,9 +478,48 @@ class PHSession:
 
     def recommended(self, page):
         rec_videos_url = f"{self.base_url}/recommended?page={page}"
-        rec_videos_page = self.session.get(rec_videos_url).text
+        rec_videos_page = self.get_from_pornhub(rec_videos_url)
 
         tree = etree.HTML(rec_videos_page)
 
         videos_container = get_xpath(tree, "//ul[@id=\"recommendedListings\"]")
         return PHSession.return_video_page(videos_container, tree, True)
+
+    @staticmethod
+    def videos_page_is_empty(page):
+        return "There are no videos..." in page
+
+    @staticmethod
+    def videos_page_exists(page):
+        return "Error Page Not Found" not in page
+
+    def history(self, page, resolved_pages=None):
+        history_videos_url = f"{self.base_url}/users/{self.username}/videos/recent?page={page}"
+        history_videos_page = self.get_from_pornhub(history_videos_url)
+
+        if resolved_pages is None:
+            lb = 1
+            ub = 50
+
+            if self.videos_page_is_empty(self.get_from_pornhub(f"{self.base_url}/users/{self.username}/videos/recent")):
+                return {
+                    "resolved_pages": 0,
+                    "results": []
+                }
+
+            while self.videos_page_exists(self.get_from_pornhub(f"{self.base_url}/users/{self.username}/videos/recent?page={ub}")):
+                ub += 50
+
+            while not (lb == (ub - 1)):
+                guess = (lb + ub) // 2
+                if self.videos_page_exists(self.get_from_pornhub(f"{self.base_url}/users/{self.username}/videos/recent?page={guess}")):
+                    lb = guess
+                else:
+                    ub = guess
+
+            resolved_pages = lb
+
+        tree = etree.HTML(history_videos_page)
+
+        videos_container = get_xpath(tree, "//ul[@id=\"moreData\"]")
+        return PHSession.return_video_page(videos_container, tree, True, resolved_pages)

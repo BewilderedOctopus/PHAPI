@@ -148,7 +148,16 @@ def frontpage_recommended():
     uid = request.args.get("authtoken")
     page = request.args.get("page")
     session = sessions[uid]
-    result = session.recommended(sort, page)
+    result = session.recommended(page)
+    return json.dumps(result)
+
+@app.route("/user/history")
+def user_history():
+    uid = request.args.get("authtoken")
+    page = request.args.get("page")
+    resolved_pages = request.args.get("resolved_pages")
+    session = sessions[uid]
+    result = session.history(page, resolved_pages)
     return json.dumps(result)
 
 if __name__ == "__main__":
